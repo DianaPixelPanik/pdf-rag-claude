@@ -1,140 +1,142 @@
-# AGENTS.md — PDF RAG Agent Architecture
+# AGENTS.md — KYC Interview Agent Architecture
 
 ## Overview
 
-This document describes the agent pipeline behind the PDF Analyser, the design decisions made at each stage, and the roadmap for evolving it from a single-turn RAG into a self-correcting, multi-step agent.
+This document describes the agent design behind the KYC onboarding system: how the interview loop works, what decisions the agent makes autonomously, and the roadmap for future improvements.
 
 ---
 
-## Current Pipeline (v1)
+## Current architecture (v1)
 
 ```
-User question
+Session start
      │
      ▼
-┌─────────────────────────────┐
-│  1. PDF Ingestion           │  PyPDF2 → raw text
-│  2. Chunking                │  RecursiveCharacterTextSplitter (10k / 1k overlap)
-│  3. Embedding               │  HuggingFace all-MiniLM-L6-v2 (local, free)
-│  4. Vector Store            │  FAISS (saved to disk)
-│  5. Retrieval               │  similarity_search (top-k = 4)
-│  6. Prompt Assembly         │  stuff-chain: context + question → prompt
-│  7. LLM Call                │  Claude claude-sonnet-4-6 (temp=0.3, max_tokens=4096)
-│  8. Response                │  streamed to Streamlit UI
-└─────────────────────────────┘
+┌───────────────────────────────────────┐
+│  Bootstrap turn                       │
+│  Agent receives: empty profile        │
+│  Agent responds: greeting + Q1        │
+└──────────────────┬────────────────────┘
+                   │
+                   ▼  (loop)
+┌───────────────────────────────────────┐
+│  User turn                            │
+│  Input to agent:                      │
+│    - Profile snapshot (filled fields) │
+│    - Missing fields list              │
+│    - Client's latest message          │
+│  Agent decides:                       │
+│    - What to extract from the answer  │
+│    - What to ask next                 │
+│    - Whether a document is needed     │
+│    - Whether interview is complete    │
+└──────────────────┬────────────────────┘
+                   │
+          ┌────────┴────────┐
+          │                 │
+    needs_document?      status=complete?
+          │                 │
+          ▼                 ▼
+  ┌──────────────┐   ┌─────────────────┐
+  │ File upload  │   │ Review summary  │
+  │ PDF → text   │   │ Doc / PEP / Risk│
+  │ → agent turn │   └─────────────────┘
+  └──────────────┘
 ```
+
+### Agent response contract
+
+Every agent response is strict JSON — no prose, no markdown:
+
+```json
+{
+  "message": "conversational message to the client",
+  "extracted": {"field_name": "value"},
+  "needs_document": "id" | "proof_of_address" | null,
+  "status": "ongoing" | "complete"
+}
+```
+
+The agent operates as a **structured extraction machine** wrapped in a conversational persona. The JSON contract enforces machine-readable output while the system prompt shapes tone and sequencing.
 
 ### Key design choices
 
 | Decision | Rationale |
 |---|---|
-| Local embeddings (MiniLM) | No extra API cost; good enough for semantic retrieval on domain docs |
-| FAISS over cloud vector DB | Simpler ops for single-user app; no latency to external store |
-| `stuff` chain type | Documents fit in context window; no summarization overhead |
-| `temperature=0.3` | Factual extraction tasks benefit from lower randomness |
-| Overlap of 1 000 chars | Prevents answers from being split across chunk boundaries |
+| Profile snapshot in every user turn | Agent always has full context; no long-term memory needed |
+| Missing fields list in prompt | Prevents agent from re-asking collected questions |
+| JSON-only response format | Enables deterministic field extraction without NLP parsing |
+| `max_tokens=1024` | Interview responses are short; limits cost and latency |
+| `temperature` default (1.0) | Conversational variation is desirable; lower temp makes answers robotic |
+| Regex fallback for JSON parse | Handles rare cases where Claude wraps JSON in markdown fences |
+
+---
+
+## Interview state machine
+
+```
+INIT → ONGOING → COMPLETE
+          │
+          ├── pending_document: "id"
+          │       └── after upload → ONGOING
+          └── pending_document: "proof_of_address"
+                  └── after upload → ONGOING
+```
+
+State lives in `st.session_state`. Fields:
+
+| Key | Type | Description |
+|---|---|---|
+| `profile` | dict | 15 KYC fields, None until collected |
+| `history` | list | Visible chat (agent / user / document bubbles) |
+| `api_msgs` | list | Full Anthropic messages array |
+| `status` | str | `"ongoing"` or `"complete"` |
+| `pending_doc` | `str\|None` | Document type currently awaited |
+| `docs_uploaded` | `set[str]` | Prevents showing uploader after submit |
+
+---
+
+## Post-interview review
+
+After `status=complete`, three statuses are computed deterministically from the profile (no LLM call):
+
+**Document verification** — parses `document_expiry` field, compares to today:
+- `< today` → Expired (fail)
+- `< 90 days` → Expiring soon (warn)
+- otherwise → Valid (ok)
+
+**PEP review** — checks `pep_status` for "yes":
+- match → Required (fail)
+- no match → Cleared (ok)
+
+**Risk review** — derived from the above:
+- any fail flag → Elevated — manual review (warn)
+- all clear → Pending (manual gate, never auto-approved)
+
+Risk review is intentionally a manual gate. The system flags; a human approves.
 
 ---
 
 ## Limitations of v1
 
-1. **Re-embeds on every question** — `get_vector_store` is called each time a question is submitted, even if the PDFs haven't changed. Cost: ~2–5 s per query on CPU.
-2. **No query rewriting** — user's raw question goes straight to retrieval; ambiguous or short queries return poor chunks.
-3. **Single retrieval pass** — no re-ranking, no second-pass verification.
-4. **No citation grounding** — response doesn't reference page numbers or chunk sources.
-5. **No memory across sessions** — conversation history lives in `st.session_state` only.
+1. **Re-reads PDFs on every document turn** — no caching of extracted text.
+2. **No cross-field validation** — agent does not catch inconsistencies (e.g., name on document ≠ declared name).
+3. **No liveness / authenticity check** — document text is trusted as-is.
+4. **Single language** — system prompt is in English; client answers in other languages are handled by Claude's multilingual capability but not formally tested.
+5. **No session persistence** — profile is lost on browser refresh.
 
 ---
 
-## Target Pipeline (v2 — Agentic RAG)
+## Roadmap (v2)
 
+**Cross-field validation turn** — after document upload, run a dedicated Claude call:
 ```
-User question
-     │
-     ▼
-┌──────────────────────┐
-│  Query Rewriter      │  LLM rewrites question for better retrieval
-└─────────┬────────────┘
-          │
-          ▼
-┌──────────────────────┐
-│  Retriever           │  FAISS similarity_search (top-k = 8)
-└─────────┬────────────┘
-          │
-          ▼
-┌──────────────────────┐
-│  Re-ranker           │  Cross-encoder scores chunks → keep top 4
-└─────────┬────────────┘
-          │
-          ▼
-┌──────────────────────┐
-│  Answer Generator    │  Claude with grounding prompt
-└─────────┬────────────┘
-          │
-          ▼
-┌──────────────────────┐
-│  Faithfulness Check  │  Claude verifies answer is supported by chunks
-└─────────┬────────────┘
-          │
-     ┌────┴────┐
-   PASS      FAIL → re-trigger with "answer must stay within context" instruction
-     │
-     ▼
-  Final response with source citations
+Compare the following declared profile with the extracted document content.
+List any discrepancies.
 ```
 
-### New components
+**Multilingual support** — detect client language from first message, switch system prompt language.
 
-**Query Rewriter** — a small Claude call before retrieval:
-```
-Given the user's question, rewrite it as a precise search query
-optimised for semantic similarity against PDF document chunks.
-Return only the rewritten query.
-```
+**Session persistence** — write profile to SQLite on every turn; resume from last state on reconnect.
 
-**Faithfulness Check** — a binary post-generation check:
-```
-Does the following answer contain only information present in the provided context?
-Answer YES or NO, then list any unsupported claims.
-```
-If `NO` → retry with stricter constraint in the prompt.
-
-**Source citations** — each retrieved chunk should carry metadata:
-- `source` (filename)
-- `page` (page number from PyPDF2 `page_number` attribute)
-- `chunk_id`
-
-These are surfaced in the response as footnotes.
-
----
-
-## Caching strategy
-
-To fix re-embedding on every query:
-
-```python
-@st.cache_resource
-def build_vector_store(file_hashes: tuple[str, ...]):
-    # keyed on MD5 of each uploaded file
-    ...
-```
-
-Cache is invalidated only when the set of uploaded files changes.
-
----
-
-## Multi-document reasoning
-
-When multiple PDFs are loaded, retrieval should be aware of document identity so the model can compare across sources:
-
-```
-Context from "contract_v1.pdf" (p.3):
-...
-
-Context from "contract_v2.pdf" (p.3):
-...
-
-Question: What changed between the two versions?
-```
-
-This requires tagging chunks with their source at ingestion time.
+**Sanctions screening hook** — after profile is complete, call a sanctions/PEP API (e.g., Comply Advantage) and surface results alongside the manual risk review status.

@@ -2,62 +2,70 @@
 
 ## Philosophy
 
-Evals are the feedback loop that turns a demo into a product. Without them, prompt and pipeline changes are just guesses. This document defines what "good" means for this RAG system and how to measure it automatically.
+A KYC agent has two failure modes that matter in production:
+
+1. **Under-collection** — the interview ends without all required fields. Compliance gap.
+2. **Wrong extraction** — the agent extracts an incorrect value and it enters the profile undetected. Fraud or regulatory risk.
+
+Evals exist to catch both before they reach real clients.
 
 ---
 
 ## Metric taxonomy
 
-### 1. Retrieval quality
+### 1. Field collection rate
 
-Measures whether the right chunks are fetched before the LLM sees them.
+Measures whether the interview terminates with all 15 fields populated.
 
-| Metric | Formula | Target |
+| Metric | Definition | Target |
 |---|---|---|
-| Recall@4 | chunks containing answer / total relevant chunks | ≥ 0.80 |
-| MRR | mean(1 / rank of first relevant chunk) | ≥ 0.65 |
-| Chunk utilisation | retrieved chunks cited in answer / 4 | ≥ 0.50 |
+| Completion rate | interviews where status=complete / total interviews | ≥ 0.95 |
+| Fields per session | mean filled fields at completion | 15.0 |
+| Turn efficiency | mean turns to complete interview | ≤ 20 |
 
-To compute these you need a **labelled retrieval dataset**: question → list of chunk ids that contain the answer. Build it once per representative PDF by manually annotating 50–100 Q&A pairs.
+### 2. Extraction accuracy
 
-### 2. Answer faithfulness
-
-Measures whether the answer is grounded in the retrieved context (no hallucination).
+Measures whether extracted field values match the ground truth.
 
 ```
-Prompt:
-  Context: {context}
-  Answer: {answer}
-
-  Does the answer contain any claim NOT supported by the context above?
-  Respond with JSON: {"faithful": true/false, "unsupported_claims": [...]}
+For each (question, client_answer, expected_extracted_fields) tuple:
+  run agent turn → compare extracted{} to expected{}
 ```
 
-Run this judge call (Claude Haiku for cost) on every eval example. Target: **faithfulness ≥ 0.95**.
+| Metric | Definition | Target |
+|---|---|---|
+| Field-level accuracy | correct extractions / total extractions | ≥ 0.95 |
+| False positives | fields extracted when client did not provide them | ≤ 0.02 |
+| Date format compliance | date fields in DD/MM/YYYY | ≥ 0.90 |
 
-### 3. Answer relevance
+### 3. Document extraction accuracy
 
-Measures whether the answer actually addresses the question.
+Measures whether the agent correctly pulls structured fields from PDF text.
 
-```
-Prompt:
-  Question: {question}
-  Answer: {answer}
+| Field | Expected source | Target accuracy |
+|---|---|---|
+| document_number | ID document | ≥ 0.95 |
+| document_expiry | ID document | ≥ 0.95 |
+| full_name | ID document (cross-check) | ≥ 0.90 |
+| address | Proof of address | ≥ 0.85 |
 
-  Score how well the answer addresses the question on a scale of 1–5.
-  Respond with JSON: {"score": int, "reason": str}
-```
+### 4. Review status correctness
 
-Target: **mean score ≥ 4.0**.
+Measures the deterministic post-interview logic (no LLM involved — these should be 1.0):
 
-### 4. Latency
+| Check | Logic | Expected |
+|---|---|---|
+| Expired doc detected | expiry < today → fail | 1.0 |
+| PEP flag raised | "yes" in pep_status → fail | 1.0 |
+| Risk elevated on fail | any fail → warn | 1.0 |
+
+### 5. Latency
 
 | Stage | p50 target | p95 target |
 |---|---|---|
-| Embedding (cold) | < 3 s | < 8 s |
-| Retrieval | < 200 ms | < 500 ms |
-| LLM first token | < 1 s | < 3 s |
-| Total response | < 8 s | < 15 s |
+| Agent turn (LLM) | < 2 s | < 5 s |
+| Document processing (PDF + LLM) | < 4 s | < 10 s |
+| Total interview duration | < 5 min | < 10 min |
 
 ---
 
@@ -66,21 +74,44 @@ Target: **mean score ≥ 4.0**.
 ```
 evals/
   dataset.jsonl        # canonical eval set
+  documents/           # sample PDF fixtures
   results/
     YYYY-MM-DD.json    # snapshot per run
 ```
 
-Each line in `dataset.jsonl`:
+Each line in `dataset.jsonl` represents one agent turn:
 
 ```json
 {
-  "id": "q001",
-  "pdf": "annual_report_2024.pdf",
-  "question": "What was the revenue in Q3?",
-  "reference_answer": "Revenue in Q3 was $4.2M, up 18% YoY.",
-  "relevant_chunk_ids": ["chunk_042", "chunk_043"]
+  "id": "t001",
+  "scenario": "standard_onboarding",
+  "profile_before": {"full_name": null, ...},
+  "client_message": "My name is Jane Smith, born 15 June 1985.",
+  "expected_extracted": {
+    "full_name": "Jane Smith",
+    "date_of_birth": "15/06/1985"
+  },
+  "expected_needs_document": null,
+  "expected_status": "ongoing"
 }
 ```
+
+Document eval entries include `document_pdf_path` and `expected_extracted_from_doc`.
+
+---
+
+## Test scenarios
+
+| Scenario | Purpose |
+|---|---|
+| Standard onboarding | Happy path — cooperative client, valid docs |
+| PEP client | Verify PEP flag is raised and review status set correctly |
+| Expired document | Verify expiry detection |
+| Near-expiry document | Verify 90-day warning |
+| Multilingual client | Client answers in Russian / French — fields extracted correctly |
+| Incomplete answers | Client gives vague answers — agent asks follow-up |
+| Adversarial PDF | Document contains prompt injection attempt |
+| Name mismatch | Declared name differs from document name |
 
 ---
 
@@ -89,34 +120,33 @@ Each line in `dataset.jsonl`:
 ```python
 # evals/run.py
 import json, time
-from pathlib import Path
 
 def run_eval(dataset_path: str, api_key: str):
     results = []
     for item in load_jsonl(dataset_path):
         start = time.time()
-        answer = query_pipeline(item["question"], item["pdf"], api_key)
+        result = agent_turn_isolated(
+            client_text=item["client_message"],
+            profile=item["profile_before"],
+            api_key=api_key,
+        )
         latency = time.time() - start
 
-        faithful = judge_faithfulness(answer, api_key)
-        relevance = judge_relevance(item["question"], answer, api_key)
+        extracted_match = result["extracted"] == item["expected_extracted"]
+        doc_match = result.get("needs_document") == item["expected_needs_document"]
+        status_match = result["status"] == item["expected_status"]
 
         results.append({
             **item,
-            "answer": answer,
-            "latency_s": latency,
-            "faithful": faithful,
-            "relevance_score": relevance,
+            "result": result,
+            "latency_s": round(latency, 2),
+            "extracted_match": extracted_match,
+            "doc_match": doc_match,
+            "status_match": status_match,
         })
 
     save_results(results)
     print_summary(results)
-```
-
-Run before and after any prompt or pipeline change:
-
-```bash
-python evals/run.py --dataset evals/dataset.jsonl
 ```
 
 ---
@@ -124,20 +154,20 @@ python evals/run.py --dataset evals/dataset.jsonl
 ## Self-improving loop
 
 ```
-Eval run → identify failures → categorise root cause → fix → re-eval
+Eval run → failures → root cause → fix prompt or code → re-eval
 ```
 
-Root cause taxonomy for this system:
+Root cause taxonomy:
 
 | Code | Cause | Fix |
 |---|---|---|
-| R1 | Wrong chunks retrieved | Tune chunk size / overlap, or add query rewriting |
-| R2 | Answer faithful but incomplete | Increase top-k or add second retrieval pass |
-| R3 | Hallucination | Tighten system prompt, add faithfulness check |
-| R4 | Answer correct but poorly formatted | Improve output format instructions in prompt |
-| R5 | Slow response | Add embedding cache, reduce max_tokens |
-
-Track metric trends across runs in `results/`. A regression on any metric blocks a merge.
+| E1 | Field not extracted despite being in answer | Add extraction example to prompt |
+| E2 | Wrong field extracted (e.g., DOB into name) | Add field format hints to prompt |
+| E3 | Agent asks for already-collected field | Check missing fields list injection |
+| E4 | Date format non-compliant | Add format normalisation in `parse_date()` |
+| E5 | `needs_document` not triggered | Review document-request rules in prompt |
+| E6 | `status=complete` with missing fields | Tighten completion condition in prompt |
+| E7 | Prompt injection from document succeeded | Add `<document_context>` delimiter to prompt |
 
 ---
 
@@ -145,10 +175,13 @@ Track metric trends across runs in `results/`. A regression on any metric blocks
 
 ```yaml
 # .github/workflows/evals.yml
-- name: Run evals
-  run: python evals/run.py
+- name: Run KYC evals
+  run: python evals/run.py --dataset evals/dataset.jsonl
 - name: Check thresholds
-  run: python evals/check_thresholds.py --faithfulness 0.95 --relevance 4.0 --recall 0.80
+  run: python evals/check_thresholds.py \
+    --completion-rate 0.95 \
+    --extraction-accuracy 0.95 \
+    --review-status-accuracy 1.0
 ```
 
-If thresholds are not met, the workflow fails and the change is blocked.
+A regression on any metric blocks the merge.

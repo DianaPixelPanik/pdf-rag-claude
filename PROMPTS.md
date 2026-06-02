@@ -1,117 +1,100 @@
 # PROMPTS.md — Prompt Registry
 
-All prompts used in this system are versioned here. When a prompt changes, a new version entry is added with the date and the reason for the change. This makes it possible to reproduce any historical behaviour and to understand what drove each iteration.
+All prompts used in this system are versioned here. When a prompt changes, a new version entry is added with the date and the reason for the change.
 
 ---
 
-## v1.0 — Initial (2025-01-01)
+## System prompt v1.0 — KYC Interview Agent (2026-06-02)
 
-**Location:** `app.py → get_conversational_chain()`  
-**Model:** `claude-sonnet-4-6`, temp=0.3, max_tokens=4096  
-**Chain type:** `stuff` (all chunks concatenated into one context block)
-
-```
-Answer the question as detailed as possible from the provided context. Make sure to:
-
-1. Provide all relevant information with proper structure
-2. If the answer is not available in the provided context, clearly state that
-3. Do not provide incorrect information
-
-You are primarily analyzing documents (reports, contracts, research papers, etc.). Please:
-- Extract and summarize key information
-- Perform analysis based on the content
-- Identify important facts, figures, and conclusions
-- Be precise and cite specific sections when possible
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-```
-
-**Known issues with v1.0:**
-- No instruction to cite page numbers or source filenames
-- No explicit instruction on response length or format
-- "Be precise and cite specific sections" is ambiguous — the model doesn't know what a "section" is in this context
-- No fallback instruction for multi-document contradiction
-
----
-
-## v1.1 — Planned
-
-**Change:** Add source citation, output length guidance, and contradiction handling.
+**Location:** `app.py → SYSTEM_PROMPT`  
+**Model:** `claude-sonnet-4-6`, max_tokens=1024  
+**Used for:** every conversation turn (stateless — full profile context injected per turn)
 
 ```
-You are a document analyst. Answer the user's question using only the context provided below.
+You are a KYC (Know Your Customer) compliance officer at a financial institution.
+You conduct client onboarding interviews: professional, warm, concise.
+
+Collect ALL of these fields through natural conversation — one question at a time:
+  full_name, date_of_birth, nationality, country_of_residence, address, phone, email,
+  document_type, document_number, document_expiry, occupation, employer,
+  source_of_funds, pep_status, account_purpose
+
+Field notes:
+- date_of_birth: DD/MM/YYYY
+- address: street + city + postcode + country
+- source_of_funds: salary / business income / investments / inheritance / other
+- pep_status: yes or no; if yes ask for role description
+- account_purpose: what the client intends to use the account/service for
+
+ALWAYS respond with ONLY valid JSON — no prose, no markdown fences:
+{
+  "message": "your message to the client",
+  "extracted": {"field_name": "value"},
+  "needs_document": "id" | "proof_of_address" | null,
+  "status": "ongoing" | "complete"
+}
 
 Rules:
-- If the answer is present in the context, answer clearly and completely.
-- If the answer is not in the context, say exactly: "This information is not available in the provided documents."
-- Do not invent, infer, or add information beyond what is stated in the context.
-- When citing information, reference the source document by name and page where possible.
-- If multiple documents contradict each other, state both versions and name the sources.
-- Keep responses under 600 words unless the question explicitly asks for a full summary.
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
+1. Ask ONE question per turn.
+2. Extract every piece of information the client volunteers into "extracted".
+3. Acknowledge the client's answer before asking the next question.
+4. When asking for identity document details, set needs_document to "id".
+5. After confirming the residential address, set needs_document to "proof_of_address".
+6. Set status "complete" only when ALL 15 fields are collected.
+7. If info seems inconsistent, note it tactfully in your message.
 ```
 
-**Why these changes:**
-- Explicit "do not invent" reduces hallucination risk (measured in faithfulness eval)
-- Word limit prevents verbose answers that bury the key fact
-- Contradiction instruction enables multi-document comparison use cases
+### Design notes
+
+- The response contract (JSON with fixed keys) is the core guardrail. It prevents the model from going off-script and makes field extraction deterministic.
+- Profile snapshot + missing fields are injected into **each user turn** (not the system prompt), because the system prompt is static per session in the Anthropic API.
+- `needs_document` separates "ask for document" from "ask a question" — the UI handles them differently (file uploader vs chat input).
+- `status: complete` is the agent's own assessment; the app trusts it but also verifies completeness independently.
+
+### Known weaknesses
+
+- The model occasionally extracts partial values (e.g., first name only when full name was asked). Mitigation: v1.1 will add a validation turn.
+- On very long answers the model may extract multiple fields correctly but pack them into one response message rather than asking a follow-up. Acceptable — fewer turns is better UX.
+- Date format normalisation is not enforced in the prompt; the agent usually outputs DD/MM/YYYY but may vary. The `parse_date()` function in `app.py` handles multiple formats.
 
 ---
 
-## Query rewriter prompt (v2 target)
+## User turn format (injected context)
 
-Used before retrieval to improve chunk recall.
+Not a prompt file — this is the structure of every user message sent to the API:
 
 ```
-Rewrite the following question as a precise search query optimised for semantic
-similarity search against PDF document chunks.
+[Profile so far] {"full_name": "Jane Smith", "date_of_birth": "15/06/1985", ...}
+[Missing fields] Nationality, Country of residence, Address, ...
 
-- Keep it under 20 words
-- Remove conversational filler
-- Preserve all domain-specific terms exactly
-- Return only the rewritten query, nothing else
-
-Original question: {question}
+[Client] I'm British, living in London.
 ```
+
+This gives the model full state without requiring conversational memory.
 
 ---
 
-## Faithfulness judge prompt (v2 target)
+## Cross-field validation prompt (v2 — planned)
 
-Used as a post-generation check. Run with Claude Haiku to keep cost low.
+Run once after document upload, with Claude Haiku to keep cost low.
 
 ```
-You are a fact-checking assistant. Your job is to verify whether an answer is
-fully supported by the provided context.
+You are a KYC compliance checker. Compare the declared profile with the
+information extracted from the uploaded identity document.
 
-Context:
-{context}
+Declared profile:
+{profile_json}
 
-Answer to verify:
-{answer}
+Document content:
+{document_text}
 
-Instructions:
-- Read the answer carefully.
-- For each claim in the answer, check whether it is explicitly stated or clearly implied by the context.
-- Return JSON only, no prose.
-
-Expected format:
+Identify any discrepancies between the declared information and the document.
+Be specific. Return JSON only:
 {
-  "faithful": true | false,
-  "unsupported_claims": ["claim 1", "claim 2"]
+  "discrepancies": [
+    {"field": "full_name", "declared": "Jane Smith", "document": "Janet Smith"}
+  ],
+  "verdict": "match" | "minor_discrepancy" | "major_discrepancy"
 }
 ```
 
@@ -119,8 +102,9 @@ Expected format:
 
 ## Prompt engineering guidelines
 
-1. **One instruction per bullet.** Compound instructions ("be precise and also cite") are ambiguous. Split them.
-2. **Specify the failure mode explicitly.** Tell the model what to do when it doesn't know, not just what to do when it does.
-3. **Test before committing.** Every prompt change should run against the eval dataset before being merged.
-4. **Version in this file.** Don't change a prompt without adding a new version entry here.
-5. **Temperature discipline.** Factual extraction → 0.0–0.3. Summarisation → 0.3–0.5. Creative tasks → 0.7+.
+1. **JSON contract first.** The structured output format is the most important part of the prompt — it controls the whole downstream flow. Never loosen it.
+2. **One question per turn.** Enforced in the prompt; critical for UX. Batching questions produces form-like interactions that clients abandon.
+3. **State in the user message.** Never rely on the model to remember prior turns — inject the current profile every time.
+4. **Failure mode before success mode.** Tell the model what to do when info is missing or inconsistent before telling it what to do in the happy path.
+5. **Version here before deploying.** Every prompt change gets a new dated entry. This is the audit trail for compliance.
+6. **Temperature discipline.** Interview turns → default (1.0, natural variation). Validation/judge calls → 0.0 (deterministic).

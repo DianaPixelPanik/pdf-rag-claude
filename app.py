@@ -426,10 +426,12 @@ def main():
 
     # ── sidebar ──
     with st.sidebar:
-        api_key = (
-            os.getenv("ANTHROPIC_API_KEY")
-            or st.secrets.get("ANTHROPIC_API_KEY", "")
-        )
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            try:
+                api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+            except Exception:
+                api_key = ""
         if not api_key:
             raw = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...")
             api_key = raw.strip().encode("ascii", "ignore").decode("ascii")
