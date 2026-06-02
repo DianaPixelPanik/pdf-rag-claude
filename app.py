@@ -2,7 +2,7 @@ import streamlit as st
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from html import escape
 from PyPDF2 import PdfReader
 import anthropic
@@ -101,6 +101,35 @@ CSS = """
     .plabel { color:#6a778f; }
     .pval   { color:#cdd3de; font-weight:500; max-width:58%; text-align:right; word-break:break-word; }
     .pempty { color:#2e3a4a; font-style:italic; }
+
+    .badge {
+        display:inline-block; padding:2px 9px; border-radius:10px;
+        font-size:.72rem; font-weight:700; letter-spacing:.03em;
+        white-space:nowrap;
+    }
+    .badge.ok      { background:#0d2e1a; color:#4caf7d; }
+    .badge.warn    { background:#2e2508; color:#f0c040; }
+    .badge.fail    { background:#2e0e0e; color:#e05555; }
+    .badge.pending { background:#1a2030; color:#6a778f; }
+
+    .srow {
+        display:flex; justify-content:space-between; align-items:center;
+        padding:.28rem 0; border-bottom:1px solid #1a2235; font-size:.8rem;
+    }
+    .srow-label { color:#8896aa; }
+
+    .review-card {
+        background:#151d2b; border:1px solid #243047;
+        border-radius:10px; padding:1.1rem 1.4rem; margin-bottom:0.8rem;
+    }
+    .review-card h4 { color:#8896aa; font-size:.75rem; letter-spacing:.06em;
+        text-transform:uppercase; margin:0 0 .6rem 0; }
+    .review-row {
+        display:flex; justify-content:space-between; align-items:center;
+        padding:.3rem 0; border-bottom:1px solid #1e2a3a; font-size:.88rem;
+    }
+    .review-row:last-child { border-bottom:none; }
+    .review-row-label { color:#8896aa; }
 </style>
 """
 
@@ -131,12 +160,26 @@ def build_user_turn(client_text: str, profile: dict) -> str:
 
 def call_agent(api_messages: list, api_key: str) -> dict:
     client = anthropic.Anthropic(api_key=api_key)
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=api_messages,
-    )
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            messages=api_messages,
+        )
+    except anthropic.AuthenticationError:
+        st.error("Invalid API key. Check your key at console.anthropic.com and re-enter it in the sidebar.")
+        st.stop()
+    except anthropic.APIConnectionError:
+        st.error("Connection error. Check your internet connection and try again.")
+        st.stop()
+    except anthropic.RateLimitError:
+        st.error("Rate limit reached. Wait a moment and try again.")
+        st.stop()
+    except anthropic.APIStatusError as e:
+        st.error(f"API error {e.status_code}: {e.message}")
+        st.stop()
+
     raw = resp.content[0].text.strip()
     try:
         return json.loads(raw)
@@ -151,12 +194,79 @@ def completeness(profile: dict) -> float:
     return sum(1 for v in profile.values() if v is not None) / len(REQUIRED_FIELDS)
 
 
+def parse_date(s: str) -> date | None:
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def compute_review_statuses(profile: dict) -> dict:
+    today = datetime.now().date()
+
+    # Document verification
+    expiry_raw = profile.get("document_expiry")
+    if not expiry_raw:
+        doc = ("pending", "Pending")
+    else:
+        exp = parse_date(expiry_raw)
+        if exp is None:
+            doc = ("warn", "Check required")
+        elif exp < today:
+            doc = ("fail", f"Expired {(today - exp).days}d ago")
+        elif (exp - today).days < 90:
+            doc = ("warn", f"Expires in {(exp - today).days}d")
+        else:
+            doc = ("ok", "Valid")
+
+    # PEP review
+    pep_raw = (profile.get("pep_status") or "").lower()
+    if not pep_raw:
+        pep = ("pending", "Pending")
+    elif any(w in pep_raw for w in ("yes", "да", "true")):
+        pep = ("fail", "Required")
+    else:
+        pep = ("ok", "Cleared")
+
+    # Risk review — manual gate; elevated automatically on fail flags
+    if pep[0] == "fail" or doc[0] == "fail":
+        risk = ("warn", "Elevated — manual review")
+    elif completeness(profile) == 1.0:
+        risk = ("pending", "Pending")
+    else:
+        risk = ("pending", "—")
+
+    return {"document_verification": doc, "pep_review": pep, "risk_review": risk}
+
+
+def badge(level: str, text: str) -> str:
+    return f'<span class="badge {level}">{escape(text)}</span>'
+
+
 # ── UI components ─────────────────────────────────────────────────────────────
 
 def render_sidebar(profile: dict):
     pct = completeness(profile)
     st.sidebar.markdown("### Client Profile")
-    st.sidebar.progress(pct, text=f"{int(pct * 100)}% complete")
+    st.sidebar.progress(pct, text=f"Profile completeness: {int(pct * 100)}%")
+    st.sidebar.markdown("")
+
+    # review statuses
+    statuses = compute_review_statuses(profile)
+    STATUS_LABELS = {
+        "document_verification": "Document verification",
+        "pep_review":            "PEP review",
+        "risk_review":           "Risk review",
+    }
+    for key, label in STATUS_LABELS.items():
+        lvl, text = statuses[key]
+        st.sidebar.markdown(
+            f'<div class="srow"><span class="srow-label">{label}</span>'
+            f'{badge(lvl, text)}</div>',
+            unsafe_allow_html=True,
+        )
     st.sidebar.markdown("")
 
     for key, label in PROFILE_FIELDS.items():
@@ -261,10 +371,12 @@ def handle_message(text: str, api_key: str):
     })
 
     if st.session_state.status == "complete":
+        statuses = compute_review_statuses(st.session_state.profile)
         write_audit({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event": "interview_complete",
             "profile": dict(st.session_state.profile),
+            "review_statuses": {k: v[1] for k, v in statuses.items()},
         })
 
 
@@ -314,7 +426,10 @@ def main():
 
     # ── sidebar ──
     with st.sidebar:
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        api_key = (
+            os.getenv("ANTHROPIC_API_KEY")
+            or st.secrets.get("ANTHROPIC_API_KEY", "")
+        )
         if not api_key:
             raw = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...")
             api_key = raw.strip().encode("ascii", "ignore").decode("ascii")
@@ -352,9 +467,27 @@ def main():
             handle_document(pending, uploaded, api_key)
             st.rerun()
 
-    # chat input
+    # chat input / completion card
     if st.session_state.status == "complete":
-        st.success("Onboarding complete. The client profile is ready for review.")
+        st.markdown("---")
+        statuses = compute_review_statuses(st.session_state.profile)
+        rows = {
+            "Profile completeness":   ("ok",                       "100%"),
+            "Document verification":  statuses["document_verification"],
+            "PEP review":             statuses["pep_review"],
+            "Risk review":            statuses["risk_review"],
+        }
+        rows_html = "".join(
+            f'<div class="review-row">'
+            f'<span class="review-row-label">{label}</span>'
+            f'{badge(lvl, text)}'
+            f'</div>'
+            for label, (lvl, text) in rows.items()
+        )
+        st.markdown(
+            f'<div class="review-card"><h4>Onboarding Summary</h4>{rows_html}</div>',
+            unsafe_allow_html=True,
+        )
     else:
         user_input = st.chat_input("Your answer...")
         if user_input:
