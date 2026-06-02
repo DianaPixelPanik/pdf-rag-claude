@@ -1,217 +1,365 @@
 import streamlit as st
-from PyPDF2 import PdfReader
-import pandas as pd
-import base64
+import json
 import os
-
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_anthropic import ChatAnthropic
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
+import re
+from datetime import datetime, timezone
+from html import escape
+from PyPDF2 import PdfReader
+import anthropic
 from dotenv import load_dotenv
-from datetime import datetime
 
 load_dotenv()
 
+AUDIT_LOG_PATH = "audit.jsonl"
 
-def get_pdf_text(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
+PROFILE_FIELDS = {
+    "full_name":           "Full name",
+    "date_of_birth":       "Date of birth",
+    "nationality":         "Nationality",
+    "country_of_residence":"Country of residence",
+    "address":             "Residential address",
+    "phone":               "Phone",
+    "email":               "Email",
+    "document_type":       "ID type",
+    "document_number":     "Document number",
+    "document_expiry":     "Document expiry",
+    "occupation":          "Occupation",
+    "employer":            "Employer",
+    "source_of_funds":     "Source of funds",
+    "pep_status":          "PEP status",
+    "account_purpose":     "Account purpose",
+}
+
+REQUIRED_FIELDS = list(PROFILE_FIELDS.keys())
+
+SYSTEM_PROMPT = """You are a KYC (Know Your Customer) compliance officer at a financial institution. \
+You conduct client onboarding interviews: professional, warm, concise.
+
+Collect ALL of these fields through natural conversation — one question at a time:
+  full_name, date_of_birth, nationality, country_of_residence, address, phone, email,
+  document_type, document_number, document_expiry, occupation, employer,
+  source_of_funds, pep_status, account_purpose
+
+Field notes:
+- date_of_birth: DD/MM/YYYY
+- address: street + city + postcode + country
+- source_of_funds: salary / business income / investments / inheritance / other
+- pep_status: yes or no; if yes ask for role description
+- account_purpose: what the client intends to use the account/service for
+
+ALWAYS respond with ONLY valid JSON — no prose, no markdown fences:
+{
+  "message": "your message to the client",
+  "extracted": {"field_name": "value"},
+  "needs_document": "id" | "proof_of_address" | null,
+  "status": "ongoing" | "complete"
+}
+
+Rules:
+1. Ask ONE question per turn.
+2. Extract every piece of information the client volunteers into "extracted".
+3. Acknowledge the client's answer before asking the next question.
+4. When asking for identity document details, set needs_document to "id".
+5. After confirming the residential address, set needs_document to "proof_of_address".
+6. Set status "complete" only when ALL 15 fields are collected.
+7. If info seems inconsistent, note it tactfully in your message."""
+
+CSS = """
+<style>
+    [data-testid="stDeployButton"] {display:none;}
+    [data-testid="stStatusWidget"]  {display:none;}
+    [data-testid="stToolbar"]       {display:none;}
+    header {visibility:hidden;}
+    #MainMenu {visibility:hidden;}
+
+    .bubble {
+        padding: 0.85rem 1.1rem;
+        border-radius: 10px;
+        margin-bottom: 0.55rem;
+        display: flex;
+        align-items: flex-start;
+        gap: 0.65rem;
+    }
+    .bubble.agent { background:#1c2535; border-left:3px solid #4caf7d; }
+    .bubble.user  { background:#18202e; border-left:3px solid #4a90d9; }
+    .bubble.doc   { background:#1a1f30; border-left:3px solid #f0a040; }
+    .blabel {
+        font-size:.67rem; font-weight:700;
+        letter-spacing:.08em; text-transform:uppercase;
+        min-width:40px; padding-top:3px;
+    }
+    .blabel.a { color:#4caf7d; }
+    .blabel.u { color:#4a90d9; }
+    .blabel.d { color:#f0a040; }
+    .btext { color:#dde1e7; font-size:.93rem; line-height:1.65; flex:1; }
+
+    .prow {
+        display:flex; justify-content:space-between;
+        padding:.22rem 0; border-bottom:1px solid #222b3a;
+        font-size:.8rem;
+    }
+    .plabel { color:#6a778f; }
+    .pval   { color:#cdd3de; font-weight:500; max-width:58%; text-align:right; word-break:break-word; }
+    .pempty { color:#2e3a4a; font-style:italic; }
+</style>
+"""
 
 
-def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=10000,
-        chunk_overlap=1000
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def write_audit(entry: dict):
+    with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def extract_pdf_text(uploaded_file) -> str:
+    reader = PdfReader(uploaded_file)
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def build_user_turn(client_text: str, profile: dict) -> str:
+    filled   = {k: v for k, v in profile.items() if v is not None}
+    missing  = [PROFILE_FIELDS[k] for k in REQUIRED_FIELDS if profile.get(k) is None]
+    snapshot = json.dumps(filled, ensure_ascii=False) if filled else "(empty)"
+    gaps     = ", ".join(missing) if missing else "none — all collected"
+    return (
+        f"[Profile so far] {snapshot}\n"
+        f"[Missing fields] {gaps}\n\n"
+        f"[Client] {client_text}"
     )
-    return text_splitter.split_text(text)
 
 
-def get_embeddings():
-    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
-
-def get_vector_store(text_chunks):
-    embeddings = get_embeddings()
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-    vector_store.save_local("faiss_index")
-    return vector_store
-
-
-def get_conversational_chain(api_key):
-    prompt_template = """
-    Answer the question as detailed as possible from the provided context. Make sure to:
-
-    1. Provide all relevant information with proper structure
-    2. If the answer is not available in the provided context, clearly state that
-    3. Do not provide incorrect information
-
-    You are primarily analyzing documents (reports, contracts, research papers, etc.). Please:
-    - Extract and summarize key information
-    - Perform analysis based on the content
-    - Identify important facts, figures, and conclusions
-    - Be precise and cite specific sections when possible
-
-    Context:\n{context}\n
-    Question:\n{question}\n
-
-    Answer:
-    """
-    model = ChatAnthropic(
+def call_agent(api_messages: list, api_key: str) -> dict:
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
         model="claude-sonnet-4-6",
-        anthropic_api_key=api_key,
-        temperature=0.3,
-        max_tokens=4096,
+        max_tokens=1024,
+        system=SYSTEM_PROMPT,
+        messages=api_messages,
     )
-    prompt = PromptTemplate(
-        template=prompt_template,
-        input_variables=["context", "question"]
-    )
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-    return chain
+    raw = resp.content[0].text.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+        return {"message": raw, "extracted": {}, "needs_document": None, "status": "ongoing"}
 
 
-def user_input(user_question, api_key, pdf_docs, conversation_history):
-    if not api_key or not pdf_docs:
-        st.warning("Please upload PDF files and provide your Anthropic API key.")
-        return
+def completeness(profile: dict) -> float:
+    return sum(1 for v in profile.values() if v is not None) / len(REQUIRED_FIELDS)
 
-    with st.spinner("Thinking..."):
-        text_chunks = get_text_chunks(get_pdf_text(pdf_docs))
-        get_vector_store(text_chunks)
 
-        embeddings = get_embeddings()
-        db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-        docs = db.similarity_search(user_question)
+# ── UI components ─────────────────────────────────────────────────────────────
 
-        chain = get_conversational_chain(api_key)
-        response = chain(
-            {"input_documents": docs, "question": user_question},
-            return_only_outputs=True
+def render_sidebar(profile: dict):
+    pct = completeness(profile)
+    st.sidebar.markdown("### Client Profile")
+    st.sidebar.progress(pct, text=f"{int(pct * 100)}% complete")
+    st.sidebar.markdown("")
+
+    for key, label in PROFILE_FIELDS.items():
+        val = profile.get(key)
+        if val:
+            st.sidebar.markdown(
+                f'<div class="prow"><span class="plabel">{label}</span>'
+                f'<span class="pval">{escape(str(val))}</span></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.sidebar.markdown(
+                f'<div class="prow"><span class="plabel">{label}</span>'
+                f'<span class="pempty">—</span></div>',
+                unsafe_allow_html=True,
+            )
+
+    if pct == 1.0:
+        st.sidebar.markdown("---")
+        st.sidebar.download_button(
+            "Export profile (JSON)",
+            data=json.dumps(profile, ensure_ascii=False, indent=2),
+            file_name=f"kyc_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            use_container_width=True,
         )
 
-    response_text = response["output_text"]
-    pdf_names = [pdf.name for pdf in pdf_docs]
-    conversation_history.append((
-        user_question,
-        response_text,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ", ".join(pdf_names)
-    ))
 
-    st.markdown("""
-    <style>
-        .chat-message {
-            padding: 1.5rem;
-            border-radius: 0.5rem;
-            margin-bottom: 1rem;
-            display: flex;
-        }
-        .chat-message.user { background-color: #2b313e; }
-        .chat-message.bot  { background-color: #475063; }
-        .chat-message .avatar { width: 20%; }
-        .chat-message .avatar img {
-            max-width: 78px;
-            max-height: 78px;
-            border-radius: 50%;
-            object-fit: cover;
-        }
-        .chat-message .message {
-            width: 80%;
-            padding: 0 1.5rem;
-            color: #fff;
-        }
-    </style>
-    """, unsafe_allow_html=True)
+def render_chat(history: list):
+    for msg in history:
+        role = msg["role"]
+        text = escape(msg["content"])
+        if role == "agent":
+            st.markdown(
+                f'<div class="bubble agent"><span class="blabel a">KYC</span>'
+                f'<span class="btext">{text}</span></div>',
+                unsafe_allow_html=True,
+            )
+        elif role == "user":
+            st.markdown(
+                f'<div class="bubble user"><span class="blabel u">You</span>'
+                f'<span class="btext">{text}</span></div>',
+                unsafe_allow_html=True,
+            )
+        elif role == "document":
+            st.markdown(
+                f'<div class="bubble doc"><span class="blabel d">Doc</span>'
+                f'<span class="btext">{text}</span></div>',
+                unsafe_allow_html=True,
+            )
 
-    for q, a, ts, pdfs in reversed(conversation_history):
-        st.markdown(f"""
-        <div class="chat-message user">
-            <div class="avatar">
-                <img src="https://i.ibb.co/CKpTnWr/user-icon-2048x2048-ihoxz4vq.png">
-            </div>
-            <div class="message">{q}</div>
-        </div>
-        <div class="chat-message bot">
-            <div class="avatar">
-                <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/8/8a/Claude_AI_logo.svg/1024px-Claude_AI_logo.svg.png">
-            </div>
-            <div class="message">{a}</div>
-        </div>
-        """, unsafe_allow_html=True)
 
-    if conversation_history:
-        df = pd.DataFrame(
-            conversation_history,
-            columns=["Question", "Answer", "Timestamp", "PDF Name"]
-        )
-        csv = df.to_csv(index=False)
-        b64 = base64.b64encode(csv.encode()).decode()
-        href = f'<a href="data:file/csv;base64,{b64}" download="conversation_history.csv"><button>Download conversation history as CSV</button></a>'
-        st.sidebar.markdown(href, unsafe_allow_html=True)
+# ── interview logic ───────────────────────────────────────────────────────────
 
-    st.balloons()
+def apply_result(result: dict):
+    for field, value in result.get("extracted", {}).items():
+        if field in st.session_state.profile and value:
+            st.session_state.profile[field] = value
+    if result.get("needs_document"):
+        doc = result["needs_document"]
+        if doc not in st.session_state.docs_uploaded:
+            st.session_state.pending_doc = doc
+    if result.get("status") == "complete":
+        st.session_state.status = "complete"
+
+
+def agent_turn(client_text: str, api_key: str):
+    turn = build_user_turn(client_text, st.session_state.profile)
+    st.session_state.api_msgs.append({"role": "user", "content": turn})
+
+    with st.spinner(""):
+        result = call_agent(st.session_state.api_msgs, api_key)
+
+    st.session_state.api_msgs.append({"role": "assistant", "content": json.dumps(result)})
+    st.session_state.history.append({"role": "agent", "content": result["message"]})
+    apply_result(result)
+    return result
+
+
+def start_interview(api_key: str):
+    result = agent_turn("Hello, I would like to complete my onboarding.", api_key)
+    write_audit({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": "interview_start",
+    })
+    # remove the auto-greeting from visible history (keep only agent reply)
+    st.session_state.history = [h for h in st.session_state.history if h["role"] == "agent"]
+    return result
+
+
+def handle_message(text: str, api_key: str):
+    st.session_state.history.append({"role": "user", "content": text})
+    result = agent_turn(text, api_key)
+
+    write_audit({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": "turn",
+        "client": text,
+        "agent": result["message"],
+        "extracted": result.get("extracted", {}),
+        "profile": dict(st.session_state.profile),
+    })
+
+    if st.session_state.status == "complete":
+        write_audit({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": "interview_complete",
+            "profile": dict(st.session_state.profile),
+        })
+
+
+def handle_document(doc_type: str, uploaded, api_key: str):
+    text = extract_pdf_text(uploaded)[:3000]
+    note = f"{uploaded.name} uploaded ({len(text)} chars extracted)"
+    st.session_state.history.append({"role": "document", "content": note})
+
+    label = "identity document" if doc_type == "id" else "proof of address"
+    result = agent_turn(
+        f"I have uploaded my {label}. Document content:\n\n{text}",
+        api_key,
+    )
+
+    st.session_state.docs_uploaded.add(doc_type)
+    st.session_state.pending_doc = None
+
+    write_audit({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": "document_upload",
+        "doc_type": doc_type,
+        "filename": uploaded.name,
+        "extracted": result.get("extracted", {}),
+    })
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def init_state():
+    defaults = {
+        "profile":       {k: None for k in REQUIRED_FIELDS},
+        "history":       [],
+        "api_msgs":      [],
+        "status":        "ongoing",
+        "pending_doc":   None,
+        "docs_uploaded": set(),
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
 def main():
-    st.set_page_config(page_title="Chat with PDFs — Claude", page_icon=":books:")
-    st.header("Chat with multiple PDFs using Claude :books:")
+    st.set_page_config(page_title="KYC Onboarding", page_icon=None, layout="wide")
+    st.markdown(CSS, unsafe_allow_html=True)
+    init_state()
 
-    if "conversation_history" not in st.session_state:
-        st.session_state.conversation_history = []
-
+    # ── sidebar ──
     with st.sidebar:
-        st.title("Settings")
-
-        api_key = st.text_input(
-            "Anthropic API Key",
-            type="password",
-            help="Get your key at https://console.anthropic.com"
-        )
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
         if not api_key:
-            st.warning("Enter your Anthropic API key to proceed.")
+            raw = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...")
+            api_key = raw.strip().encode("ascii", "ignore").decode("ascii")
+        else:
+            st.caption("API key loaded from environment.")
 
         st.markdown("---")
-
-        pdf_docs = st.file_uploader(
-            "Upload PDF files",
-            accept_multiple_files=True,
-            type=["pdf"]
-        )
-
-        col1, col2 = st.columns(2)
-        if col1.button("Process"):
-            if pdf_docs:
-                with st.spinner("Processing PDFs..."):
-                    try:
-                        text = get_pdf_text(pdf_docs[:1])
-                        if not text.strip():
-                            st.warning("PDF appears empty or has no extractable text.")
-                        else:
-                            st.success("PDFs ready!")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-            else:
-                st.warning("Upload at least one PDF first.")
-
-        if col2.button("Reset"):
-            st.session_state.conversation_history = []
+        render_sidebar(st.session_state.profile)
+        st.markdown("---")
+        if st.button("Restart", use_container_width=True):
+            for k in ["profile", "history", "api_msgs", "status", "pending_doc", "docs_uploaded"]:
+                st.session_state.pop(k, None)
             st.rerun()
 
-    user_question = st.text_input("Ask a question about your PDFs")
-    if user_question:
-        user_input(
-            user_question,
-            api_key,
-            pdf_docs,
-            st.session_state.conversation_history
-        )
+    # ── main area ──
+    st.markdown("## KYC Onboarding")
+
+    if not api_key:
+        st.info("Enter your Anthropic API key in the sidebar to begin.")
+        return
+
+    if not st.session_state.history:
+        start_interview(api_key)
+        st.rerun()
+
+    render_chat(st.session_state.history)
+
+    # document upload prompt
+    pending = st.session_state.pending_doc
+    if pending and pending not in st.session_state.docs_uploaded:
+        label = "Identity Document (passport / national ID)" if pending == "id" else "Proof of Address"
+        st.markdown(f"**Document required: {label}**")
+        uploaded = st.file_uploader(f"Upload {label} (PDF)", type=["pdf"], key=f"up_{pending}")
+        if uploaded:
+            handle_document(pending, uploaded, api_key)
+            st.rerun()
+
+    # chat input
+    if st.session_state.status == "complete":
+        st.success("Onboarding complete. The client profile is ready for review.")
+    else:
+        user_input = st.chat_input("Your answer...")
+        if user_input:
+            handle_message(user_input, api_key)
+            st.rerun()
 
 
 if __name__ == "__main__":
